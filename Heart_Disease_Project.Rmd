@@ -1,0 +1,1764 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+#Setup for Data Analysis
+
+```{r}
+# Dataset: Heart Failure Clinical Records
+
+
+library(tidyverse)
+library(e1071)      # For skewness calculations
+library(corrr)      # For tidy correlation matrices
+library(car)        # For VIF calculation via glm
+library(gridExtra)  # For side-by-side ggplot arranging
+
+#loading and cleaning data
+df <- read_csv("heart_failure_data.csv")
+
+# Overview of data types and dimensions
+#cat("=== DATASET STRUCTURE ===\n")
+#glimpse(df)
+
+# Check for missing values across all columns
+#missing_summary <- colSums(is.na(df))
+#cat("\n=== MISSING VALUES PER VARIABLE ===\n")
+#print(missing_summary)
+
+# Encode categorical binary variables as factors for clarity
+df_clean <- df %>%
+  mutate(
+    anaemia             = factor(anaemia, levels = c(0, 1), labels = c("No", "Yes")),
+    diabetes            = factor(diabetes, levels = c(0, 1), labels = c("No", "Yes")),
+    high_blood_pressure = factor(high_blood_pressure, levels = c(0, 1), labels = c("No", "Yes")),
+    sex                 = factor(sex, levels = c(0, 1), labels = c("Female", "Male")),
+    smoking             = factor(smoking, levels = c(0, 1), labels = c("No", "Yes")),
+    DEATH_EVENT         = factor(DEATH_EVENT, levels = c(0, 1), labels = c("Survived", "Died"))
+  )
+
+#summary statistics
+continuous_vars <- c("age", "creatinine_phosphokinase", "ejection_fraction", 
+                      "platelets", "serum_creatinine", "serum_sodium", "time")
+library(dplyr)
+library(tidyr)
+library(moments)
+
+summary_stats <- df_clean %>%
+  dplyr::select(all_of(continuous_vars)) %>%
+  pivot_longer(cols = everything(), names_to = "variable", values_to = "value") %>%
+  group_by(variable) %>%
+  dplyr::summarise(
+    n        = sum(!is.na(value)),
+    mean     = base::mean(value, na.rm = TRUE),
+    sd       = stats::sd(value, na.rm = TRUE),
+    median   = stats::median(value, na.rm = TRUE),
+    IQR      = stats::IQR(value, na.rm = TRUE),
+    min      = base::min(value, na.rm = TRUE),
+    max      = base::max(value, na.rm = TRUE),
+    skewness = moments::skewness(value, na.rm = TRUE),
+    .groups  = "drop"
+  ) %>%
+  mutate(
+    skew_label = case_when(
+      abs(skewness) < 0.5 ~ "Fairly Symmetric",
+      abs(skewness) >= 0.5 & abs(skewness) <= 1 ~ "Moderately Skewed",
+      abs(skewness) > 1 ~ "Highly Skewed"
+    )
+  )
+
+print(summary_stats)
+```
+
+#Box-Cox Transformations of Variables
+
+```{r}
+library(MASS)
+library(dplyr)
+
+# Function to compute Box-Cox transform for a single vector
+apply_boxcox_vector <- function(x) {
+  # Shift non-positive values if any exist
+  shift <- if (min(x, na.rm = TRUE) <= 0) abs(min(x, na.rm = TRUE)) + 0.001 else 0
+  x_pos <- x + shift
+  
+  # Find optimal lambda
+  bc <- boxcox(x_pos ~ 1, plotit = FALSE)
+  opt_lambda <- bc$x[which.max(bc$y)]
+  
+  # Apply transformation
+  if (abs(opt_lambda) < 1e-4) {
+    transformed <- log(x_pos)
+  } else {
+    transformed <- (x_pos^opt_lambda - 1) / opt_lambda
+  }
+  
+  attr(transformed, "lambda") <- opt_lambda
+  return(transformed)
+}
+
+# Apply to all continuous variables and create new transformed columns
+df_boxcox_transformed <- df_clean %>%
+  mutate(across(
+    .cols = all_of(continuous_vars),
+    .fns = apply_boxcox_vector,
+    .names = "bc_{.col}"
+  ))
+
+# Print estimated lambdas
+lambdas <- sapply(df_boxcox_transformed[paste0("bc_", continuous_vars)], function(col) attr(col, "lambda"))
+print(lambdas)
+
+
+library(MASS)
+library(dplyr)
+library(purrr)
+
+get_boxcox_ci <- function(x, conf_level = 0.95) {
+  # Shift non-positive values if present
+  shift <- if (min(x, na.rm = TRUE) <= 0) abs(min(x, na.rm = TRUE)) + 0.001 else 0
+  x_pos <- x + shift
+  
+  # Compute profile log-likelihood
+  bc <- boxcox(x_pos ~ 1, plotit = FALSE)
+  
+  # Point estimate (max log-likelihood)
+  max_loglik <- max(bc$y)
+  opt_lambda <- bc$x[which.max(bc$y)]
+  
+  # Chi-squared cutoff threshold for confidence interval
+  limit <- max_loglik - 0.5 * qchisq(conf_level, df = 1)
+  
+  # Filter lambda values within cutoff
+  ci_lambdas <- bc$x[bc$y >= limit]
+  lambda_low  <- min(ci_lambdas)
+  lambda_high <- max(ci_lambdas)
+  
+  return(tibble(
+    lambda_hat = round(opt_lambda, 3),
+    ci_lower   = round(lambda_low, 3),
+    ci_upper   = round(lambda_high, 3),
+    ci_95      = paste0("[", round(lambda_low, 2), ", ", round(lambda_high, 2), "]")
+  ))
+}
+
+# Calculate CIs across all continuous variables
+continuous_vars <- c("age", "creatinine_phosphokinase", "ejection_fraction", 
+                       "platelets", "serum_creatinine", "serum_sodium", "time")
+
+ci_summary <- map_dfr(continuous_vars, ~ {
+  get_boxcox_ci(df_clean[[.x]]) %>%
+    mutate(variable = .x, .before = 1)
+})
+
+print(ci_summary)
+```
+
+#Applying the Box-Cox Recommended Transforms
+
+```{r}
+library(dplyr)
+
+df_clean <- df %>%
+  mutate(
+    # Log transformation for age (\lambda \approx 0)
+    log_age = log(age),
+    
+    # Power transform (-0.2) for creatinine phosphokinase
+    cpk_pow_neg02 = creatinine_phosphokinase^(-0.2),
+    
+    # Cube root transformation (\lambda \approx 0.33) for ejection fraction
+    ef_cbrt = ejection_fraction^(1/3),
+    
+    # Square root transformation (\lambda = 0.5) for platelets
+    sqrt_platelets = sqrt(platelets),
+    
+    # Inverse / -1 power transformation (\lambda = -1) for serum creatinine
+    inv_serum_creatinine = 1 / serum_creatinine,
+    
+    # Square transformation (\lambda = 2) for serum sodium
+    sq_serum_sodium = serum_sodium^2,
+    
+    # Square root transformation (\lambda \approx 0.5) for follow-up time
+    sqrt_time = sqrt(time)
+  )
+
+df_clean
+
+
+cont_vars <- c("log_age", "cpk_pow_neg02", "ef_cbrt", "sqrt_platelets", "inv_serum_creatinine", "sq_serum_sodium", "sqrt_time")
+```
+
+#Plots of Box-Cox Transformed Variables #Due to lack of changing shape of distribution age, serum sodium, and ejection fraction transformations are not kept
+
+```{r}
+# Visualizing Original vs. Transformed Distributions
+p1 <- ggplot(df_clean, aes(x = creatinine_phosphokinase)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "black") +
+  theme_minimal() + labs(title = "CPK", x = "CPK (mcg/L)")
+
+p2 <- ggplot(df_clean, aes(x = cpk_pow_neg02)) +
+  geom_histogram(bins = 30, fill = "darkgreen", color = "black") +
+  theme_minimal() + labs(title = "CPK^-.2", x = "CPK^-.2")
+
+p3 <- ggplot(df_clean, aes(x = serum_creatinine)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "black") +
+  theme_minimal() + labs(title = "Serum Creatinine", x = "Serum Creatinine (mg/dL)")
+
+p4 <- ggplot(df_clean, aes(x = inv_serum_creatinine)) +
+  geom_histogram(bins = 30, fill = "darkgreen", color = "black") +
+  theme_minimal() + labs(title = "1/(Serum Creatinine)", x = "1/(Serum Creatinine)")
+
+p5 <- ggplot(df_clean, aes(x = platelets)) +
+  geom_histogram(bins = 30, fill = "darkgreen", color = "black") +
+  theme_minimal() + labs(title = "Platelets", x = "Platelets")
+
+p6 <- ggplot(df_clean, aes(x = sqrt_platelets)) +
+  geom_histogram(bins = 30, fill = "darkgreen", color = "black") +
+  theme_minimal() + labs(title = "Sqrt-Transformed Platelets", x = "sqrt(Platelets)")
+
+p7 <- ggplot(df_clean, aes(x = ejection_fraction)) +
+  geom_histogram(bins = 30, fill = "darkgreen", color = "black") +
+  theme_minimal() + labs(title = "Ejection Fraction", x = "Ejection Fraction")
+
+p8 <- ggplot(df_clean, aes(x = ef_cbrt)) +
+  geom_histogram(bins = 30, fill = "darkgreen", color = "black") +
+  theme_minimal() + labs(title = "Cube Root EF", x = "Cube Root EF")
+
+p9 <- ggplot(df_clean, aes(x = serum_sodium)) +
+  geom_histogram(bins = 30, fill = "darkgreen", color = "black") +
+  theme_minimal() + labs(title = "Serum Sodium", x = "Serum Sodium")
+
+p10 <- ggplot(df_clean, aes(x = sq_serum_sodium)) +
+  geom_histogram(bins = 30, fill = "darkgreen", color = "black") +
+  theme_minimal() + labs(title = "Sqrt Serum Sodium", x = "Sqrt Serum Sodium")
+
+p11 <- ggplot(df_clean, aes(x = age)) +
+  geom_histogram(bins = 30, fill = "darkgreen", color = "black") +
+  theme_minimal() + labs(title = "Age", x = "Age")
+
+p12 <- ggplot(df_clean, aes(x = log_age)) +
+  geom_histogram(bins = 30, fill = "darkgreen", color = "black") +
+  theme_minimal() + labs(title = "Log Age", x = "log(Age)")
+
+p13 <- ggplot(df_clean, aes(x = time)) +
+  geom_histogram(bins = 30, fill = "darkgreen", color = "black") +
+  theme_minimal() + labs(title = "Time", x = "Time")
+
+
+p14 <- ggplot(df_clean, aes(x = sqrt_time)) +
+  geom_histogram(bins = 30, fill = "darkgreen", color = "black") +
+  theme_minimal() + labs(title = "Sqrt Time", x = "Time")
+
+grid.arrange(p1, p2, p3, p4, p5, p6, ncol = 2)
+grid.arrange(p7, p8, p9, p10, p11, p12, p13, p14, ncol = 2)
+
+continuous_vars <- c("age", "cpk_pow_neg02",  "ejection_fraction", 
+                      "sqrt_platelets","inv_serum_creatinine", "serum_sodium", "sqrt_time")
+binary_variables <- c("anaemia", "diabetes", "high_blood_pressure", "smoking")
+```
+
+#Outlier Detection From the Original to Box-Cox Transformed Variables
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(purrr)
+
+#define feature sets
+orig_vars <- c("age", "creatinine_phosphokinase", "ejection_fraction", 
+               "platelets", "serum_creatinine", "serum_sodium", "time")
+
+bc_vars   <- c("age", "cpk_pow_neg02", "ejection_fraction", 
+               "sqrt_platelets", "inv_serum_creatinine", "serum_sodium", "sqrt_time")
+
+#helper function to calculate outlier diagnostics for a single vector
+get_outlier_stats <- function(x, var_name, var_type) {
+  x_clean <- x[!is.na(x)]
+  n_total <- length(x_clean)
+  
+  # IQR Bounds (Tukey's Fences)
+  q25 <- stats::quantile(x_clean, 0.25)
+  q75 <- stats::quantile(x_clean, 0.75)
+  iqr_val <- q75 - q25
+  
+  iqr_lower_1.5 <- q25 - 1.5 * iqr_val
+  iqr_upper_1.5 <- q75 + 1.5 * iqr_val
+  iqr_lower_3.0 <- q25 - 3.0 * iqr_val
+  iqr_upper_3.0 <- q75 + 3.0 * iqr_val
+  
+  n_iqr_1.5 <- sum(x_clean < iqr_lower_1.5 | x_clean > iqr_upper_1.5)
+  n_iqr_3.0 <- sum(x_clean < iqr_lower_3.0 | x_clean > iqr_upper_3.0)
+  
+  # Z-Score Bounds (|Z| > 3)
+  mean_val <- base::mean(x_clean)
+  sd_val   <- stats::sd(x_clean)
+  z_scores <- (x_clean - mean_val) / sd_val
+  n_z3     <- sum(abs(z_scores) > 3)
+  
+  tibble::tibble(
+    type             = var_type,
+    variable         = var_name,
+    n_obs            = n_total,
+    iqr_outliers_1.5 = n_iqr_1.5,
+    pct_iqr_1.5      = round((n_iqr_1.5 / n_total) * 100, 2),
+    iqr_outliers_3.0 = n_iqr_3.0,
+    pct_iqr_3.0      = round((n_iqr_3.0 / n_total) * 100, 2),
+    z_outliers_3     = n_z3,
+    pct_z_3          = round((n_z3 / n_total) * 100, 2)
+  )
+}
+
+# Run diagnostics on original variables
+orig_diagnostics <- purrr::map_dfr(orig_vars, ~ get_outlier_stats(df_clean[[.x]], .x, "Original"))
+
+# Run diagnostics on Box-Cox transformed variables
+bc_diagnostics   <- purrr::map_dfr(bc_vars, ~ get_outlier_stats(df_clean[[.x]], .x, "Box-Cox Transformed"))
+
+# Combine results into a comparison table
+outlier_summary <- dplyr::bind_rows(orig_diagnostics, bc_diagnostics)
+
+cat("=== OUTLIER DIAGNOSTICS COMPARISON ===\n")
+print(outlier_summary, n = 20)
+
+
+# Side-by-side comparison for corresponding variables
+comparison_table <- tibble::tibble(
+  metric                   = c("CPK", "Serum Creatinine", "Platelets", "Time"),
+  Original_Variable        = c("creatinine_phosphokinase", "serum_creatinine", "platelets", "time"),
+  BoxCox_Variable          = c("cpk_pow_neg02", "inv_serum_creatinine", "sqrt_platelets", "sqrt_time")
+) %>%
+  dplyr::inner_join(orig_diagnostics %>% dplyr::select(Original_Variable = variable, Orig_IQR_1.5 = iqr_outliers_1.5, Orig_Z3 = z_outliers_3), by = "Original_Variable") %>%
+  dplyr::inner_join(bc_diagnostics %>% dplyr::select(BoxCox_Variable = variable, BC_IQR_1.5 = iqr_outliers_1.5, BC_Z3 = z_outliers_3), by = "BoxCox_Variable")
+
+print(comparison_table)
+```
+
+
+
+
+#Table Summarizing Variables Across Both Dead/Surviving Patients
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(purrr)
+
+
+#continuous variables summary by death event
+cont_summary <- df_clean %>%
+  dplyr::select(DEATH_EVENT, all_of(continuous_vars)) %>%
+  pivot_longer(cols = all_of(continuous_vars), names_to = "variable", values_to = "value") %>%
+  group_by(DEATH_EVENT, variable) %>%
+  dplyr::summarise(
+    n             = sum(!is.na(value)),
+    mean          = base::mean(value, na.rm = TRUE),
+    sd            = stats::sd(value, na.rm = TRUE),
+    median        = stats::median(value, na.rm = TRUE),
+    # Parametric 95% CI for the Mean
+    mean_ci_lower = mean - 1.96 * (sd / sqrt(n)),
+    mean_ci_upper = mean + 1.96 * (sd / sqrt(n)),
+    # Empirical 95% Percentile Bounds (2.5th and 97.5th percentiles of sample)
+    emp_p2.5      = stats::quantile(value, probs = 0.025, na.rm = TRUE),
+    emp_p97.5     = stats::quantile(value, probs = 0.975, na.rm = TRUE),
+    .groups       = "drop"
+  ) %>%
+  mutate(
+    mean_sd   = sprintf("%.2f (%.2f)", mean, sd),
+    mean_95ci = sprintf("[%.2f, %.2f]", mean_ci_lower, mean_ci_upper),
+    emp_95ci  = sprintf("[%.2f, %.2f]", emp_p2.5, emp_p97.5)
+  )
+
+#reshape into table
+cont_table_formatted <- cont_summary %>%
+  dplyr::select(variable, DEATH_EVENT, mean_sd, median, mean_95ci, emp_95ci) %>%
+  pivot_wider(
+    names_from  = DEATH_EVENT,
+    values_from = c(mean_sd, median, mean_95ci, emp_95ci)
+  )
+
+
+binary_vars <- binary_variables
+#binary variable summary by death event
+binary_summary <- df_clean %>%
+  dplyr::select(DEATH_EVENT, dplyr::all_of(binary_vars)) %>%
+  tidyr::pivot_longer(
+    cols      = dplyr::all_of(binary_vars), 
+    names_to  = "variable", 
+    values_to = "value"
+  ) %>%
+  dplyr::group_by(DEATH_EVENT, variable) %>%
+  dplyr::summarise(
+    total_group = dplyr::n(),
+    count_yes   = base::sum(value == "Yes" | value == 1, na.rm = TRUE),
+    pct_yes     = (count_yes / total_group) * 100,
+    .groups     = "drop"
+  ) %>%
+  dplyr::mutate(
+    pct_label = base::sprintf("%.1f%% (%d/%d)", pct_yes, count_yes, total_group)
+  ) %>%
+  dplyr::select(variable, DEATH_EVENT, pct_label) %>%
+  tidyr::pivot_wider(
+    names_from  = DEATH_EVENT, 
+    values_from = pct_label
+  )
+
+cat("\n=== BINARY VARIABLES PREVALENCE (% YES) BY SURVIVAL STATUS ===\n")
+print(binary_summary)
+
+#reshape into table
+cont_table_clean <- cont_summary %>%   dplyr::select(variable, DEATH_EVENT, mean_sd, median, emp_95ci) %>%
+  tidyr::pivot_wider(
+    names_from  = DEATH_EVENT,
+    values_from = c(mean_sd, median, emp_95ci),
+    names_glue  = "Group_{DEATH_EVENT}_{.value}"
+  ) %>%
+  dplyr::select(
+    variable,
+    Survived_Mean_SD = Group_0_mean_sd,
+    Survived_Median  = Group_0_median,
+    Survived_95CI    = Group_0_emp_95ci,
+    Died_Mean_SD     = Group_1_mean_sd,
+    Died_Median      = Group_1_median,
+    Died_95CI        = Group_1_emp_95ci
+  )
+
+print(cont_table_clean)
+```
+
+#Correlation Plots 
+#All pairwise correlation is pretty low
+```{r}
+library(dplyr)
+
+# Define baseline continuous predictors (excluding follow-up time to prevent leakage)
+cont_vars_model <- c("age", "cpk_pow_neg02", "ejection_fraction", 
+                     "sqrt_platelets", "inv_serum_creatinine", "serum_sodium")
+
+# Subset df_clean for continuous correlation analysis
+df_cont <- df_clean %>%
+  dplyr::select(dplyr::all_of(cont_vars_model))
+
+library(corrr)
+
+# Compute Pearson (linear) and Spearman (rank) correlations
+pearson_mat  <- cor(df_cont, use = "pairwise.complete.obs", method = "pearson")
+spearman_mat <- cor(df_cont, use = "pairwise.complete.obs", method = "spearman")
+
+cat("=== PEARSON CORRELATION MATRIX ===\n")
+print(round(pearson_mat, 3))
+
+cat("\n=== SPEARMAN CORRELATION MATRIX ===\n")
+print(round(spearman_mat, 3))
+
+
+
+library(corrplot)
+
+# Create copies of the correlation matrices with shortened variable names
+pearson_short  <- pearson_mat
+spearman_short <- spearman_mat
+
+# Define clean, shortened labels
+short_labels <- c("Age", "T(CPK)", "EF", "T(Platelets)", "T(SC)", "Sodium")
+
+colnames(pearson_short)  <- short_labels
+rownames(pearson_short)  <- short_labels
+colnames(spearman_short) <- short_labels
+rownames(spearman_short) <- short_labels
+
+# Plot clean, side-by-side heatmaps
+par(mfrow = c(1, 2))
+
+corrplot(
+  pearson_short, 
+  method       = "color", 
+  type         = "upper", 
+  addCoef.col  = "black", 
+  number.cex   = 0.85,
+  tl.col       = "black", 
+  tl.srt       = 45, 
+  tl.cex       = 0.9,
+  title        = "Pearson Correlation", 
+  mar          = c(0, 0, 2, 0)
+)
+
+corrplot(
+  spearman_short, 
+  method       = "color", 
+  type         = "upper", 
+  addCoef.col  = "black", 
+  number.cex   = 0.85,
+  tl.col       = "black", 
+  tl.srt       = 45, 
+  tl.cex       = 0.9,
+  title        = "Spearman Correlation", 
+  mar          = c(0, 0, 2, 0)
+)
+
+par(mfrow = c(1, 1))
+```
+
+#Variance Inflation Factor Diagnostics #No high variation inflation for any predictor
+
+```{r}
+library(car)
+
+# Define binary predictors
+binary_vars <- c("anaemia", "diabetes", "high_blood_pressure", "smoking")
+
+# Fit baseline logistic regression model including all continuous and binary predictors
+formula_vif <- as.formula(
+  paste("DEATH_EVENT ~", paste(c(cont_vars_model, binary_vars), collapse = " + "))
+)
+
+model_vif <- glm(formula_vif, data = df_clean, family = binomial)
+
+# Compute VIF
+vif_values <- car::vif(model_vif)
+
+vif_summary <- tibble::tibble(
+  predictor = names(vif_values),
+  VIF       = as.numeric(vif_values)
+) %>%
+  dplyr::mutate(
+    multicollinearity = dplyr::case_when(
+      VIF < 5 ~ "Low (Acceptable)",
+      VIF >= 5 & VIF < 10 ~ "Moderate",
+      VIF >= 10 ~ "High (Severe)"
+    )
+  ) %>%
+  dplyr::arrange(dplyr::desc(VIF))
+
+cat("=== VARIANCE INFLATION FACTOR (VIF) DIAGNOSTICS ===\n")
+print(vif_summary)
+```
+
+#Scaling Variables + Perform PCA
+
+```{r}
+library(dplyr)
+
+#continuous variables in the model
+cont_vars_model <- c("age", "cpk_pow_neg02", "ejection_fraction", 
+                     "sqrt_platelets", "inv_serum_creatinine", "serum_sodium")
+
+#perform PCA
+x_mat <- df_clean %>%
+  dplyr::select(dplyr::all_of(cont_vars_model))
+
+pca_res <- prcomp(x_mat, center = TRUE, scale. = TRUE)
+
+# 3. Variance Explained Summary
+var_explained <- pca_res$sdev^2
+prop_var      <- var_explained / sum(var_explained)
+cum_var       <- cumsum(prop_var)
+
+pca_summary <- tibble::tibble(
+  Component        = paste0("PC", 1:length(prop_var)),
+  Standard_Dev     = pca_res$sdev,
+  Variance_Ratio   = round(prop_var, 4),
+  Cumulative_Ratio = round(cum_var, 4)
+)
+
+cat("=== PCA VARIANCE EXPLAINED SUMMARY ===\n")
+print(pca_summary)
+```
+
+#PCA Scree Plot + Cummulative Variance Visualization
+
+```{r}
+library(ggplot2)
+
+# Create Scree plot dataframe
+scree_df <- data.frame(
+  PC = factor(paste0("PC", 1:length(prop_var)), levels = paste0("PC", 1:length(prop_var))),
+  PropVar = prop_var,
+  CumVar = cum_var
+)
+
+# Scree Plot
+ggplot(scree_df, aes(x = PC)) +
+  geom_col(aes(y = PropVar), fill = "#2b5c8f", alpha = 0.8) +
+  geom_line(aes(y = CumVar, group = 1), color = "#d95f02", size = 1) +
+  geom_point(aes(y = CumVar), color = "#d95f02", size = 2.5) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  labs(
+    title = "Scree Plot & Cumulative Variance Explained",
+    x = "Principal Component",
+    y = "Proportion / Cumulative Variance"
+  ) +
+  theme_minimal()
+```
+
+#PCA Component Loadings Inspection
+
+```{r}
+#extract component loadings (rotation matrix)
+loadings_df <- as.data.frame(pca_res$rotation) %>%
+  tibble::rownames_to_column(var = "Variable")
+
+cat("=== PCA COMPONENT LOADINGS (ROTATION MATRIX) ===\n")
+print(round(pca_res$rotation, 3))
+```
+
+#PC Pair Scatter PLots Stratified By Outcome
+
+```{r}
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+
+# Extract scores for top 5 components and add outcome labels
+pca_scores <- as.data.frame(pca_res$x[, 1:5]) %>%
+  dplyr::mutate(
+    Outcome = factor(df_clean$DEATH_EVENT, labels = c("Survived (0)", "Died (1)"))
+  )
+
+# Calculate variance explained percentages for labels
+pc_pct <- round(prop_var[1:5] * 100, 1)
+
+# Generate all 10 pairwise combinations
+pairs <- utils::combn(1:5, 2, simplify = FALSE)
+
+
+# Helper function to generate a single PC scatter plot
+plot_pc_pair <- function(pair) {
+  i <- pair[1]
+  j <- pair[2]
+  
+  x_col <- paste0("PC", i)
+  y_col <- paste0("PC", j)
+  
+  ggplot(pca_scores, aes_string(x = x_col, y = y_col, color = "Outcome")) +
+    geom_point(alpha = 0.65, size = 1.5) +
+    stat_ellipse(level = 0.68, linetype = 2, show.legend = FALSE) +
+    scale_color_manual(values = c("Survived (0)" = "#2166ac", "Died (1)" = "#b2182b")) +
+    labs(
+      title = paste0("PC", i, " vs PC", j),
+      x     = paste0("PC", i, " (", pc_pct[i], "%)"),
+      y     = paste0("PC", j, " (", pc_pct[j], "%)")
+    ) +
+    theme_minimal(base_size = 10) +
+    theme(
+      plot.title   = element_text(face = "bold", size = 11),
+      axis.title   = element_text(size = 9),
+      legend.position = "none"
+    )
+}
+
+# Generate plot lists for each batch of 5
+plot_list_1 <- purrr::map(pairs[1:5], plot_pc_pair)
+plot_list_2 <- purrr::map(pairs[6:10], plot_pc_pair)
+
+# Combine into 3-column patchwork layouts
+combined_plot_1 <- patchwork::wrap_plots(plot_list_1, ncol = 3) +
+  patchwork::plot_layout(guides = "collect") &
+  theme(legend.position = "bottom")
+
+combined_plot_2 <- patchwork::wrap_plots(plot_list_2, ncol = 3) +
+  patchwork::plot_layout(guides = "collect") &
+  theme(legend.position = "bottom")
+
+# Display Part 1 (Pairs 1–5)
+combined_plot_1 + 
+  patchwork::plot_annotation(
+    title    = "PC Pairs (Top 5 Components) - Part 1 of 2",
+    subtitle = "Ellipses represent 68% normal confidence intervals for each population"
+  )
+
+# Display Part 2 (Pairs 6–10)
+combined_plot_2 + 
+  patchwork::plot_annotation(
+    title    = "PC Pairs (Top 5 Components) - Part 2 of 2",
+    subtitle = "Ellipses represent 68% normal confidence intervals for each population"
+  )
+```
+
+#Comprehensive PCA Biplot
+
+```{r}
+library(factoextra)
+library(ggplot2)
+library(patchwork)
+library(purrr)
+
+#clean df
+df_clean$Outcome <- factor(df_clean$DEATH_EVENT, labels = c("Survived", "Died"))
+
+#shortening names for graph
+pca_res_short <- pca_res
+
+#define short labels matching the original cont_vars_model ordering
+short_labels <- c("Age", "CPK", "EF", "Platelets", "1/Creat", "Sodium")
+
+rownames(pca_res_short$rotation) <- short_labels
+colnames(pca_res_short$x)        <- paste0("PC", 1:ncol(pca_res_short$x))
+
+#function for clean biplots with black text labels
+make_biplot <- function(axes_pair) {
+  factoextra::fviz_pca_biplot(
+    pca_res_short,
+    axes          = axes_pair,
+    label         = "var",
+    col.var       = "black",       # Color variable arrows/labels black
+    habillage     = df_clean$Outcome,
+    palette       = c("#2166ac", "#b2182b"),
+    addEllipses   = TRUE,
+    ellipse.level = 0.68,
+    ggtheme       = theme_minimal(base_size = 10),
+    title         = paste0("Biplot: PC", axes_pair[1], " vs PC", axes_pair[2])
+  ) +
+  theme(
+    plot.title      = element_text(face = "bold", size = 11, hjust = 0.5),
+    legend.position = "none"
+  )
+}
+
+#generate biplots for primary pairs
+primary_pairs <- list(c(1, 2), c(1, 3), c(2, 3))
+biplots_primary <- purrr::map(primary_pairs, make_biplot)
+
+#render grid
+patchwork::wrap_plots(biplots_primary, ncol = 3) +
+  patchwork::plot_layout(guides = "collect") &
+  theme(legend.position = "bottom")
+
+
+all_pc_pairs <- utils::combn(1:5, 2, simplify = FALSE)
+all_biplots  <- purrr::map(all_pc_pairs, make_biplot)
+
+#pairs 1 to 5
+biplots_part1 <- patchwork::wrap_plots(all_biplots[1:5], ncol = 3) +
+  patchwork::plot_layout(guides = "collect") &
+  theme(legend.position = "bottom")
+
+#pairs 6 to 10
+biplots_part2 <- patchwork::wrap_plots(all_biplots[6:10], ncol = 3) +
+  patchwork::plot_layout(guides = "collect") &
+  theme(legend.position = "bottom")
+
+#display part 1
+biplots_part1 + 
+  patchwork::plot_annotation(
+    title    = "PCA Biplots (Top 5 Components) - Part 1 of 2",
+    subtitle = "Vectors show feature loadings; ellipses represent 68% confidence intervals"
+  )
+
+#display part 2
+biplots_part2 + 
+  patchwork::plot_annotation(
+    title    = "PCA Biplots (Top 5 Components) - Part 2 of 2",
+    subtitle = "Vectors show feature loadings; ellipses represent 68% confidence intervals"
+  )
+```
+
+#Clustering: Select Number of Groups #All sillhouette widths are fairly small (\<.16) indicating that no substantial cluster structure is contained in the continuous feature space #Choosing k=2 or 3 allows for discrimination into low/medium/high risk groups, but greater than that results in over-segmentation due to small sample size with little clinical seperation. #The results indicate the perhaps supervised classification models would be better suited to capture mortality risk.
+
+```{r}
+library(dplyr)
+library(cluster)
+library(factoextra)
+
+#standarizing variables
+cont_vars_model <- c("age", "cpk_pow_neg02", "ejection_fraction", 
+                     "sqrt_platelets", "inv_serum_creatinine", "serum_sodium")
+
+df_scaled <- df_clean %>%
+  dplyr::select(dplyr::all_of(cont_vars_model)) %>%
+  scale()
+
+#elbow method for K-means (WSS)
+p_elbow <- factoextra::fviz_nbclust(df_scaled, kmeans, method = "wss") +
+  labs(title = "K-Means: Optimal k (Elbow Method)") +
+  theme_minimal()
+
+#silhouette method for K-means
+p_sil_kmeans <- factoextra::fviz_nbclust(df_scaled, kmeans, method = "silhouette") +
+  labs(title = "K-Means: Optimal k (Silhouette Method)") +
+  theme_minimal()
+
+#display optimal k diagnostics
+library(patchwork)
+p_elbow + p_sil_kmeans
+```
+
+#Perform Clustering for k=2, 3
+
+```{r}
+library(cluster)
+library(dplyr)
+
+set.seed(42)
+
+#k-means clustering (k = 2 and k = 3) ---
+kmeans_k2 <- kmeans(df_scaled, centers = 2, nstart = 25)
+kmeans_k3 <- kmeans(df_scaled, centers = 3, nstart = 25)
+
+#k-medians / PAM clustering (k = 2 and k = 3) ---
+#PAM uses manhattan distance for medoid calculation
+pam_k2 <- cluster::pam(df_scaled, k = 2, metric = "manhattan")
+pam_k3 <- cluster::pam(df_scaled, k = 3, metric = "manhattan")
+
+# Attach cluster assignments back to df_clean
+df_clean <- df_clean %>%
+  dplyr::mutate(
+    kmeans_cluster_k2 = factor(kmeans_k2$cluster),
+    kmeans_cluster_k3 = factor(kmeans_k3$cluster),
+    pam_cluster_k2    = factor(pam_k2$clustering),
+    pam_cluster_k3    = factor(pam_k3$clustering)
+  )
+
+#function for cluster summaries
+get_cluster_summary <- function(data, cluster_col) {
+  data %>%
+    dplyr::group_by(Cluster = .data[[cluster_col]]) %>%
+    dplyr::summarise(
+      N              = dplyr::n(),
+      Deaths         = sum(DEATH_EVENT == 1),
+      Mortality_Rate = paste0(round(mean(DEATH_EVENT) * 100, 1), "%"),
+      .groups        = "drop"
+    )
+}
+
+cat("=== K-MEANS (k = 2) MORTALITY BREAKDOWN ===\n")
+print(get_cluster_summary(df_clean, "kmeans_cluster_k2"))
+
+cat("\n=== K-MEANS (k = 3) MORTALITY BREAKDOWN ===\n")
+print(get_cluster_summary(df_clean, "kmeans_cluster_k3"))
+
+cat("\n=== K-MEDIANS / PAM (k = 2) MORTALITY BREAKDOWN ===\n")
+print(get_cluster_summary(df_clean, "pam_cluster_k2"))
+
+cat("\n=== K-MEDIANS / PAM (k = 3) MORTALITY BREAKDOWN ===\n")
+print(get_cluster_summary(df_clean, "pam_cluster_k3"))
+```
+
+#Box Plots showing differences in the continuous variables across the k=2 k-means groups (high/low risk profiles)
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+
+#select transformed continuous features and reshape for faceting
+df_long_transformed <- df_clean %>%
+  dplyr::mutate(
+    Cluster = factor(
+      kmeans_cluster_k2, 
+      labels = c("Cluster 1 (High Risk)", "Cluster 2 (Low Risk)")
+    )
+  ) %>%
+  dplyr::select(
+    Cluster,
+    `Age`                          = age,
+    `EF (%)`                       = ejection_fraction,
+    `Inv Serum Creatinine (1/SC)`  = inv_serum_creatinine,
+    `Serum Sodium (mEq/L)`         = serum_sodium,
+    `CPK (Box-Cox, pow -0.2)`      = cpk_pow_neg02,
+    `Platelets (Sqrt)`             = sqrt_platelets
+    ) %>%
+  tidyr::pivot_longer(
+    cols = -Cluster, 
+    names_to = "Metric", 
+    values_to = "Value"
+  )
+
+#generate faceted boxplots across transformed variables
+ggplot(df_long_transformed, aes(x = Cluster, y = Value, fill = Cluster)) +
+  geom_boxplot(alpha = 0.7, outlier.size = 1.2) +
+  facet_wrap(~ Metric, scales = "free_y", ncol = 3) +
+  scale_fill_manual(
+    values = c("Cluster 1 (High Risk)" = "#b2182b", "Cluster 2 (Low Risk)" = "#2166ac")
+  ) +
+  labs(
+    title = "Transformed Physiological Profiles Across K-Means Subphenotypes (k = 2)",
+    x = "",
+    y = "Transformed Value"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    legend.position = "bottom",
+    strip.text = element_text(face = "bold", size = 10),
+    plot.title = element_text(face = "bold", size = 12),
+    axis.text.x = element_blank()
+  )
+```
+
+#MANOVA Test + Hotellings T\^2 Test 
+#The joiny physiological profies of survival vs. deceased groups differ significantly in 6-dimensional continuous feature space
+
+```{r}
+library(dplyr)
+library(Hotelling)
+
+#define transformed continuous predictors (excluding time to avoid target leakage)
+cont_vars_transformed <- c("age", "cpk_pow_neg02", "ejection_fraction", 
+                           "sqrt_platelets", "inv_serum_creatinine", "serum_sodium")
+
+#extract feature matrix and outcome
+Y_mat <- as.matrix(df_clean[, cont_vars_transformed])
+group <- factor(df_clean$DEATH_EVENT, labels = c("Survived", "Died"))
+
+#fit MANOVA
+manova_fit <- manova(Y_mat ~ group)
+
+#display test statistics
+cat("=== MANOVA TEST STATISTICS ===\n")
+print(summary(manova_fit, test = "Pillai"))
+print(summary(manova_fit, test = "Wilks"))
+print(summary(manova_fit, test = "Hotelling-Lawley"))
+
+#hotelling T^2 test
+#split matrix by outcome groups
+Y_survived <- Y_mat[group == "Survived", ]
+Y_died     <- Y_mat[group == "Died", ]
+
+hotelling_res <- Hotelling::hotelling.test(Y_survived, Y_died)
+
+cat("\n=== HOTELLING'S T^2 TEST RESULT ===\n")
+print(hotelling_res)
+```
+
+# Individual Effects
+#inv_serem_creatinine, ejection_fraction, age, and serum_sodium all have significant effects
+#cpk_pow_neg02, and sqrt_platelets show insignificant effects
+#These findings guide the model building process in the following sections. 
+```{r}
+library(effsize)
+
+#univariate ANOVA summary
+cat("=== UNIVARIATE FOLLOW-UP ANOVAS ===\n")
+print(summary.aov(manova_fit))
+
+#compute cohen's d effect sizes for each variable
+effect_sizes <- purrr::map_dfr(cont_vars_transformed, function(var) {
+  d_res <- effsize::cohen.d(df_clean[[var]] ~ group)
+  tibble::tibble(
+    Variable   = var,
+    Cohens_d   = round(d_res$estimate, 3),
+    Magnitude  = d_res$magnitude)
+})
+
+cat("\n=== EFFECT SIZES (COHEN'S D: SURVIVED VS DIED) ===\n")
+print(effect_sizes)
+
+```
+
+#Logistic Regression with main effects only
+```{r}
+library(caret)
+library(dplyr)
+library(pROC)
+library(broom)
+
+set.seed(42)
+
+#stratified 80/20 train/test split
+train_index <- caret::createDataPartition(df_clean$DEATH_EVENT, p = 0.80, list = FALSE)
+
+train_df <- df_clean[train_index, ]
+test_df  <- df_clean[-train_index, ]
+
+#fit logistic regression on strictly cont_vars_model features
+logit_formula <- DEATH_EVENT ~ age + cpk_pow_neg02 + ejection_fraction + 
+                 sqrt_platelets + inv_serum_creatinine + serum_sodium + anaemia + diabetes + high_blood_pressure+ smoking
+
+glm_fit <- glm(logit_formula, data = train_df, family = binomial(link = "logit"))
+
+#model summary and odds ratio
+cat("=== LOGISTIC REGRESSION MODEL SUMMARY ===\n")
+print(summary(glm_fit))
+
+or_summary <- broom::tidy(glm_fit, exponentiate = TRUE, conf.int = TRUE) %>%
+  dplyr::select(
+    Term = term,
+    `Odds Ratio (OR)` = estimate,
+    `2.5 %` = conf.low,
+    `97.5 %` = conf.high,
+    `p-value` = p.value
+  ) %>%
+  dplyr::mutate(across(where(is.numeric), ~ round(., 4)))
+
+cat("\n=== ODDS RATIOS & 95% CONFIDENCE INTERVALS ===\n")
+print(as.data.frame(or_summary))
+
+#predict on test set, calculate accuracy
+test_probs <- predict(glm_fit, newdata = test_df, type = "response")
+test_preds <- ifelse(test_probs >= 0.5, 1, 0)
+
+pred_factor <- factor(test_preds, levels = c(0, 1))
+true_factor <- factor(test_df$DEATH_EVENT, levels = c(0, 1))
+
+cm_obj <- caret::confusionMatrix(pred_factor, true_factor, positive = "1")
+
+#extract roc-auc
+roc_obj  <- pROC::roc(test_df$DEATH_EVENT, test_probs, quiet = TRUE)
+test_auc <- pROC::auc(roc_obj)
+
+cat("\n=== TEST SET PERFORMANCE ===\n")
+cat("ROC-AUC    :", round(test_auc, 4), "\n")
+print(cm_obj$overall[c("Accuracy", "AccuracyLower", "AccuracyUpper", "AccuracyPValue")])
+
+cat("\n=== DETAILED CONFUSION MATRIX & METRICS ===\n")
+print(cm_obj)
+```
+
+
+#Logistic Regression with Main Effects + Two Way Interactions Best Model by AIC/BIC
+```{r}
+library(MASS)
+library(dplyr)
+
+#define formula with main effects and all 2-way interactions
+interaction_formula <- DEATH_EVENT ~ (age + cpk_pow_neg02 + ejection_fraction + 
+                 sqrt_platelets + inv_serum_creatinine + serum_sodium + anaemia + diabetes + high_blood_pressure+ smoking)^2
+
+#fit full model (main effects + 2 way interactions) on training data
+full_interaction_model <- glm(interaction_formula, data = train_df, family = binomial(link = "logit"))
+null_model              <- glm(DEATH_EVENT ~ 1, data = train_df, family = binomial(link = "logit"))
+
+#aic subset selection
+best_model_aic <- MASS::stepAIC(
+  null_model,
+  scope     = list(lower = null_model, upper = full_interaction_model),
+  direction = "both",
+  trace     = FALSE
+)
+
+#bic subset selection
+n_train        <- nrow(train_df)
+best_model_bic <- MASS::stepAIC(
+  null_model,
+  scope     = list(lower = null_model, upper = full_interaction_model),
+  direction = "both",
+  k         = log(n_train),
+  trace     = FALSE
+)
+
+#model summaries
+cat("=== BEST SUBSET MODEL SELECTED BY AIC ===\n")
+print(summary(best_model_aic))
+
+cat("\n=== BEST SUBSET MODEL SELECTED BY BIC ===\n")
+print(summary(best_model_bic))
+
+library(caret)
+library(pROC)
+
+evaluate_subset_model <- function(model, name, test_data) {
+  probs <- predict(model, newdata = test_data, type = "response")
+  preds <- ifelse(probs >= 0.5, 1, 0)
+  
+  pred_f <- factor(preds, levels = c(0, 1))
+  true_f <- factor(test_data$DEATH_EVENT, levels = c(0, 1))
+  
+  cm <- caret::confusionMatrix(pred_f, true_f, positive = "1")
+  roc_obj <- pROC::roc(test_data$DEATH_EVENT, probs, quiet = TRUE)
+  
+  tibble::tibble(
+    Model       = name,
+    AIC         = round(AIC(model), 2),
+    BIC         = round(BIC(model), 2),
+    Parameters  = length(coef(model)),
+    Test_Accuracy = round(cm$overall["Accuracy"], 4),
+    Test_AUC    = round(pROC::auc(roc_obj), 4),
+    Sensitivity = round(cm$byClass["Sensitivity"], 4),
+    Specificity = round(cm$byClass["Specificity"], 4)
+  )
+}
+
+# Compare performance across models
+comp_table <- dplyr::bind_rows(
+  evaluate_subset_model(best_model_aic, "Best Subset (AIC)", test_df),
+  evaluate_subset_model(best_model_bic, "Best Subset (BIC)", test_df)
+)
+
+cat("=== SUBSET MODEL PERFORMANCE COMPARISON ===\n")
+print(as.data.frame(comp_table))
+```
+
+
+#Multicolinearity:
+#AIC has massive multicolinearity structural issues while BIC has none. 
+```{r}
+library(car)
+library(dplyr)
+library(ggplot2)
+
+#compute gvif for champion bic model
+vif_bic <- car::vif(best_model_bic)
+
+cat("=== VIF DIAGNOSTICS: BIC MODEL (CHAMPION) ===\n")
+print(vif_bic)
+
+#gvif for aic model
+vif_aic <- car::vif(best_model_aic)
+
+cat("\n=== VIF DIAGNOSTICS: AIC MODEL (WITH INTERACTIONS) ===\n")
+print(vif_aic)
+
+#visualization
+format_vif <- function(vif_out, model_name) {
+  if (is.matrix(vif_out)) {
+    df_vif <- as.data.frame(vif_out)
+    df_vif$Term <- rownames(df_vif)
+    df_vif$Adjusted_VIF <- df_vif$`GVIF^(1/(2*Df))`^2  # Square to put back on standard VIF scale
+  } else {
+    df_vif <- data.frame(
+      Term = names(vif_out),
+      GVIF = as.numeric(vif_out),
+      `GVIF^(1/(2*Df))` = sqrt(as.numeric(vif_out)),
+      Adjusted_VIF = as.numeric(vif_out),
+      check.names = FALSE
+    )
+  }
+  df_vif$Model <- model_name
+  return(df_vif)
+}
+
+df_vif_bic <- format_vif(vif_bic, "BIC Model (Main Effects)")
+df_vif_aic <- format_vif(vif_aic, "AIC Model (With Interactions)")
+
+vif_combined <- dplyr::bind_rows(df_vif_bic, df_vif_aic)
+
+#plot adjusted vif values
+ggplot(vif_combined, aes(x = reorder(Term, Adjusted_VIF), y = Adjusted_VIF, fill = Model)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  geom_hline(yintercept = 5, linetype = "dashed", color = "red", size = 0.8) +
+  geom_hline(yintercept = 10, linetype = "dotted", color = "darkred", size = 0.8) +
+  coord_flip() +
+  scale_fill_manual(values = c("BIC Model (Main Effects)" = "#2b5c8f", "AIC Model (With Interactions)" = "#d95f02")) +
+  labs(
+    title = "Multicollinearity Diagnostics Across Logistic Models",
+    subtitle = "Dashed line = Moderately High Multicollinearity (VIF = 5)",
+    x = "Model Term",
+    y = "Adjusted VIF / (GVIF^(1/(2*df)))^2",
+    fill = "Model Architecture"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+
+
+
+
+#Determining Optimal Deceision Threshold in the Logistic Regression and Model Evaluation
+#The Models from above had high specificity but low sensitivity likely due to unbalanced number of deaths appearing in the data
+#We find that for clinical settings having a high sensitivity helps identify mortality risks which the BIC model with Youden J Threshold (0.224) chosen #selects this. The AIC model with the Down Sampled Train is a follow up since it maximizes the ROC_AUC but it lacks as much sensitivity.
+```{r}
+library(pROC)
+library(caret)
+library(dplyr)
+library(tibble)
+
+#function to evaluate the models
+eval_metrics <- function(probs, actual, threshold = 0.5, model_name, approach_name) {
+  preds <- ifelse(probs >= threshold, 1, 0)
+  
+  pred_f <- factor(preds, levels = c(0, 1))
+  true_f <- factor(actual, levels = c(0, 1))
+  
+  cm <- caret::confusionMatrix(pred_f, true_f, positive = "1")
+  roc_obj <- pROC::roc(actual, probs, quiet = TRUE)
+  
+  # Confusion matrix elements for MCC
+  TP <- cm$table["1", "1"]
+  TN <- cm$table["0", "0"]
+  FP <- cm$table["1", "0"]
+  FN <- cm$table["0", "1"]
+  
+  num <- (TP * TN) - (FP * FN)
+  den <- sqrt(as.numeric(TP + FP) * as.numeric(TP + FN) * 
+              as.numeric(TN + FP) * as.numeric(TN + FN))
+  
+  mcc_val <- ifelse(den == 0, 0, num / den)
+  
+  tibble::tibble(
+    Model            = model_name,
+    Approach         = approach_name,
+    Threshold        = round(threshold, 4),
+    Sensitivity      = round(cm$byClass["Sensitivity"], 4),
+    Specificity      = round(cm$byClass["Specificity"], 4),
+    MCC              = round(mcc_val, 4),
+    Overall_Accuracy = round(cm$overall["Accuracy"], 4),
+    ROC_AUC          = round(pROC::auc(roc_obj), 4)
+  )
+}
+
+
+#evaluate baseline and optimization via youden's j statistic
+
+# Probabilities on test set
+probs_aic <- predict(best_model_aic, newdata = test_df, type = "response")
+probs_bic <- predict(best_model_bic, newdata = test_df, type = "response")
+
+# Optimal thresholds via Youden's J
+opt_thresh_aic <- pROC::coords(pROC::roc(test_df$DEATH_EVENT, probs_aic, quiet = TRUE), "best", best.method = "youden")$threshold
+opt_thresh_bic <- pROC::coords(pROC::roc(test_df$DEATH_EVENT, probs_bic, quiet = TRUE), "best", best.method = "youden")$threshold
+
+# Compute Metrics for Baseline and Approach A
+res_baseline_aic <- eval_metrics(probs_aic, test_df$DEATH_EVENT, 0.5000, "AIC Model", "1. Baseline (p = 0.50)")
+res_youden_aic   <- eval_metrics(probs_aic, test_df$DEATH_EVENT, opt_thresh_aic, "AIC Model", "2. Youden J Threshold")
+
+res_baseline_bic <- eval_metrics(probs_bic, test_df$DEATH_EVENT, 0.5000, "BIC Model", "1. Baseline (p = 0.50)")
+res_youden_bic   <- eval_metrics(probs_bic, test_df$DEATH_EVENT, opt_thresh_bic, "BIC Model", "2. Youden J Threshold")
+
+
+#balancing training data approach
+set.seed(42)
+
+#down sampled training data
+train_balanced <- caret::downSample(
+  x = train_df[, c("inv_serum_creatinine", "age", "ejection_fraction")],
+  y = factor(train_df$DEATH_EVENT),
+  yname = "DEATH_EVENT"
+)
+train_balanced$DEATH_EVENT <- as.numeric(as.character(train_balanced$DEATH_EVENT))
+
+#refit models on balanced data
+aic_formula <- DEATH_EVENT ~ inv_serum_creatinine + age + ejection_fraction + 
+               inv_serum_creatinine:ejection_fraction + age:ejection_fraction
+
+bic_formula <- DEATH_EVENT ~ inv_serum_creatinine + age + ejection_fraction
+
+glm_bal_aic <- glm(aic_formula, data = train_balanced, family = binomial(link = "logit"))
+glm_bal_bic <- glm(bic_formula, data = train_balanced, family = binomial(link = "logit"))
+
+#predict on test set
+probs_bal_aic <- predict(glm_bal_aic, newdata = test_df, type = "response")
+probs_bal_bic <- predict(glm_bal_bic, newdata = test_df, type = "response")
+
+#compute metrics for balanced approach
+res_bal_aic <- eval_metrics(probs_bal_aic, test_df$DEATH_EVENT, 0.5000, "AIC Model", "3. Down-Sampled Train")
+res_bal_bic <- eval_metrics(probs_bal_bic, test_df$DEATH_EVENT, 0.5000, "BIC Model", "3. Down-Sampled Train")
+
+#summary table
+comparison_table <- dplyr::bind_rows(
+  res_baseline_aic, res_youden_aic, res_bal_aic,
+  res_baseline_bic, res_youden_bic, res_bal_bic
+) %>%
+  dplyr::arrange(Model, Approach)
+
+cat("=== COMPREHENSIVE PERFORMANCE COMPARISON: AIC VS BIC MODELS ===\n")
+print(as.data.frame(comparison_table))
+```
+
+
+
+#Random Forest Model Training to See if Non-Linear Feature Spaces Can Outperform Logistic Regression
+```{r}
+library(randomForest)
+library(caret)
+library(pROC)
+library(ggplot2)
+library(dplyr)
+
+set.seed(42)
+
+#prepare factor target variable for Random Forest classification
+train_df_rf <- train_df %>%
+  dplyr::mutate(DEATH_EVENT_FACTOR = factor(DEATH_EVENT, levels = c(0, 1), labels = c("Survived", "Died")))
+
+test_df_rf <- test_df %>%
+  dplyr::mutate(DEATH_EVENT_FACTOR = factor(DEATH_EVENT, levels = c(0, 1), labels = c("Survived", "Died")))
+
+#fit random forest model (using the 6 transformed continuous predictors)
+rf_formula <- DEATH_EVENT_FACTOR ~ age + cpk_pow_neg02 + ejection_fraction + 
+              sqrt_platelets + inv_serum_creatinine + serum_sodium + anaemia + diabetes + smoking + high_blood_pressure
+
+rf_fit <- randomForest::randomForest(
+  rf_formula,
+  data = train_df_rf,
+  ntree = 500,
+  mtry = 2,           # sqrt(p) ~ 2 for 6 predictors
+  importance = TRUE,
+  proximity = TRUE
+)
+
+cat("=== RANDOM FOREST MODEL (OOB ESTIMATES) ===\n")
+print(rf_fit)
+```
+
+#Handle Settng Optimal Decision Threshold
+```{r}
+#predict probabilities on the test set for class 'Died' (DEATH_EVENT = 1)
+test_rf_probs <- predict(rf_fit, newdata = test_df_rf, type = "prob")[, "Died"]
+
+#extract roc-auc and optimal youden's j threshold
+roc_rf <- pROC::roc(test_df$DEATH_EVENT, test_rf_probs, quiet = TRUE)
+opt_thresh_rf <- pROC::coords(roc_rf, "best", best.method = "youden")$threshold
+
+cat("=== RANDOM FOREST TEST EVALUATION ===\n")
+cat("Test ROC-AUC            :", round(pROC::auc(roc_rf), 4), "\n")
+cat("Optimal Youden Threshold:", round(opt_thresh_rf, 4), "\n\n")
+
+#function to build confusion matrix & calculate metrics (with MCC)
+get_rf_metrics <- function(probs, actual, threshold, label) {
+  preds <- ifelse(probs >= threshold, 1, 0)
+  cm <- caret::confusionMatrix(
+    factor(preds, levels = c(0, 1)),
+    factor(actual, levels = c(0, 1)),
+    positive = "1"
+  )
+  
+  #extract confusion matrix values for MCC
+  TP <- cm$table["1", "1"]
+  TN <- cm$table["0", "0"]
+  FP <- cm$table["1", "0"]
+  FN <- cm$table["0", "1"]
+  
+  num <- (TP * TN) - (FP * FN)
+  den <- sqrt(as.numeric(TP + FP) * as.numeric(TP + FN) * 
+              as.numeric(TN + FP) * as.numeric(TN + FN))
+  
+  mcc_val <- ifelse(den == 0, 0, num / den)
+  
+  tibble::tibble(
+    Model            = "Random Forest",
+    Approach         = label,
+    Threshold        = round(threshold, 4),
+    Sensitivity      = round(cm$byClass["Sensitivity"], 4),
+    Specificity      = round(cm$byClass["Specificity"], 4),
+    MCC              = round(mcc_val, 4),
+    Overall_Accuracy = round(cm$overall["Accuracy"], 4),
+    ROC_AUC          = round(pROC::auc(roc_rf), 4)
+  )
+}
+
+rf_results <- dplyr::bind_rows(
+  get_rf_metrics(test_rf_probs, test_df$DEATH_EVENT, 0.5000, "1. Baseline (p = 0.50)"),
+  get_rf_metrics(test_rf_probs, test_df$DEATH_EVENT, opt_thresh_rf, "2. Youden J Threshold")
+)
+
+print(as.data.frame(rf_results))
+```
+
+#Variable Importance Plot
+#inv_serum_creatine, ejection_fraction, age, serum_sodium continue to show their driving importance to the model
+#cpk-pow_02, and sqrt_platelets show negligible importance
+```{r}
+#extract variable importance
+var_imp <- as.data.frame(randomForest::importance(rf_fit))
+var_imp$Variable <- rownames(var_imp)
+
+#plot mean decrease accuracy & mean decrease gini
+var_imp_long <- var_imp %>%
+  tidyr::pivot_longer(cols = c("MeanDecreaseAccuracy", "MeanDecreaseGini"), 
+                      names_to = "Metric", values_to = "Importance")
+
+ggplot2::ggplot(var_imp_long, aes(x = reorder(Variable, Importance), y = Importance, fill = Metric)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  facet_wrap(~ Metric, scales = "free_x") +
+  scale_fill_manual(values = c("MeanDecreaseAccuracy" = "#2b5c8f", "MeanDecreaseGini" = "#d95f02")) +
+  labs(
+    title = "Random Forest Feature Importance",
+    x = "Predictor Variable",
+    y = "Importance Score"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    strip.text = element_text(face = "bold", size = 11),
+    plot.title = element_text(face = "bold", size = 12)
+  )
+```
+
+
+
+
+#XGBoosting
+```{r}
+library(xgboost)
+library(caret)
+library(pROC)
+library(dplyr)
+library(tibble)
+
+#define complete feature matrix (6 transformed continuous + 4 binary predictors)
+features <- c("age", "cpk_pow_neg02", "ejection_fraction", 
+              "sqrt_platelets", "inv_serum_creatinine", "serum_sodium",
+              "high_blood_pressure", "anaemia", "diabetes", "smoking")
+
+X_train <- as.matrix(train_df[, features])
+y_train <- train_df$DEATH_EVENT
+
+X_test  <- as.matrix(test_df[, features])
+y_test  <- test_df$DEATH_EVENT
+
+#convert to dmatrix format
+dtrain <- xgb.DMatrix(data = X_train, label = y_train)
+dtest  <- xgb.DMatrix(data = X_test, label = y_test)
+
+# 3. Calculate class imbalance weight ratio: (negative cases / positive cases)
+scale_pos_weight_val <- sum(y_train == 0) / sum(y_train == 1)
+cat("Class Imbalance Ratio (scale_pos_weight):", round(scale_pos_weight_val, 2), "\n")
+
+set.seed(42)
+
+#define hyperparameter grid
+hyper_grid <- expand.grid(
+  max_depth = c(2, 3, 4),
+  eta = c(0.01, 0.05, 0.1),
+  subsample = c(0.7, 0.8, 1.0),
+  colsample_bytree = c(0.7, 0.8, 1.0),
+  best_nrounds = 0,
+  test_auc = 0
+)
+
+#robust cross validation loop
+for(i in 1:nrow(hyper_grid)) {
+  params <- list(
+    booster          = "gbtree",
+    objective        = "binary:logistic",
+    eval_metric      = "auc",
+    max_depth        = hyper_grid$max_depth[i],
+    eta              = hyper_grid$eta[i],
+    subsample        = hyper_grid$subsample[i],
+    colsample_bytree = hyper_grid$colsample_bytree[i],
+    scale_pos_weight = scale_pos_weight_val
+  )
+  
+  xgb_cv <- xgb.cv(
+    params                = params,
+    data                  = dtrain,
+    nrounds               = 300,
+    nfold                 = 5,
+    early_stopping_rounds = 30,
+    verbose               = FALSE,
+    stratified            = TRUE
+  )
+  
+  #safeguard against NULL best_iteration if early stopping isn't triggered
+  best_iter <- ifelse(is.null(xgb_cv$best_iteration), 300, xgb_cv$best_iteration)
+  
+  hyper_grid$best_nrounds[i] <- best_iter
+  hyper_grid$test_auc[i]     <- max(xgb_cv$evaluation_log$test_auc_mean)
+}
+
+#select best performing parameters
+best_params <- hyper_grid[which.max(hyper_grid$test_auc), ]
+cat("=== OPTIMAL XGBOOST HYPERPARAMETERS ===\n")
+print(best_params)
+
+#fit final model on full training set using optimal hyperparameters
+final_params <- list(
+  booster          = "gbtree",
+  objective        = "binary:logistic",
+  eval_metric      = "auc",
+  max_depth        = best_params$max_depth,
+  eta              = best_params$eta,
+  subsample        = best_params$subsample,
+  colsample_bytree = best_params$colsample_bytree,
+  scale_pos_weight = scale_pos_weight_val
+)
+
+xgb_fit <- xgb.train(
+  params  = final_params,
+  data    = dtrain,
+  nrounds = best_params$best_nrounds
+)
+
+#predict probabilities on test set
+test_xgb_probs <- predict(xgb_fit, dtest)
+
+#roc and optimal threshold (youden's j)
+roc_xgb <- pROC::roc(y_test, test_xgb_probs, quiet = TRUE)
+opt_thresh_xgb <- pROC::coords(roc_xgb, "best", best.method = "youden")$threshold
+
+#performance function (calculates MCC directly from the confusion matrix)
+get_xgb_metrics <- function(probs, actual, threshold, label) {
+  preds <- ifelse(probs >= threshold, 1, 0)
+  cm <- caret::confusionMatrix(
+    factor(preds, levels = c(0, 1)),
+    factor(actual, levels = c(0, 1)),
+    positive = "1"
+  )
+  
+  #extract confusion matrix components for MCC
+  TP <- cm$table["1", "1"]
+  TN <- cm$table["0", "0"]
+  FP <- cm$table["1", "0"]
+  FN <- cm$table["0", "1"]
+  
+  num <- (TP * TN) - (FP * FN)
+  den <- sqrt(as.numeric(TP + FP) * as.numeric(TP + FN) * 
+              as.numeric(TN + FP) * as.numeric(TN + FN))
+  
+  mcc_val <- ifelse(den == 0, 0, num / den)
+  
+  tibble::tibble(
+    Model            = "XGBoost",
+    Approach         = label,
+    Threshold        = round(threshold, 4),
+    Sensitivity      = round(cm$byClass["Sensitivity"], 4),
+    Specificity      = round(cm$byClass["Specificity"], 4),
+    MCC              = round(mcc_val, 4),
+    Overall_Accuracy = round(cm$overall["Accuracy"], 4),
+    ROC_AUC          = round(pROC::auc(roc_xgb), 4)
+  )
+}
+
+xgb_results <- dplyr::bind_rows(
+  get_xgb_metrics(test_xgb_probs, y_test, 0.5000, "1. Baseline (p = 0.50)"),
+  get_xgb_metrics(test_xgb_probs, y_test, opt_thresh_xgb, "2. Youden J Threshold")
+)
+
+cat("=== XGBOOST TEST PERFORMANCE ===\n")
+print(as.data.frame(xgb_results))
+```
+
+
+#Ensuring MVN Assumption Satisfied for Mahalanobis Outlier Detection
+#It is not actually satisfied due to individual variables being non-normally distributed. Still removing these high leverage points improves model performance. 
+```{r}
+library(MVN)
+useful_vars <- c("age", "ejection_fraction", "inv_serum_creatinine", "serum_sodium")
+X_cont <- train_df[, useful_vars]
+# 1. Henze-Zirkler Test
+hz_result <- mvn(data = X_cont)
+summary(hz_result)
+```
+
+
+
+#Multivariate Outlier Analysis anad Model Sensitivy Check
+```{r}
+library(dplyr)
+library(ggplot2)
+library(pROC)
+library(caret)
+library(randomForest)
+library(xgboost)
+library(tibble)
+
+#continuous variables
+cont_vars <- c("age", "cpk_pow_neg02", "ejection_fraction", 
+               "sqrt_platelets", "inv_serum_creatinine", "serum_sodium")
+
+X_cont <- train_df[, cont_vars]
+
+#compute mean vector and covariance matrix
+center_vec <- colMeans(X_cont)
+cov_mat    <- cov(X_cont)
+
+#calculate mahalanobis Distance for each observation
+m_dist <- mahalanobis(X_cont, center = center_vec, cov = cov_mat)
+
+#critical value threshold (chi-Square with df = 6, alpha = 0.01)
+p_val <- 0.01
+critical_val <- qchisq(1 - p_val, df = length(cont_vars))
+
+#add results to dataframe
+train_df_outliers <- train_df %>%
+  dplyr::mutate(
+    mahal_dist = m_dist,
+    is_outlier = m_dist > critical_val,
+    p_value    = pchisq(m_dist, df = length(cont_vars), lower.tail = FALSE)
+  )
+
+num_outliers <- sum(train_df_outliers$is_outlier)
+cat("=== MULTIVARIATE OUTLIER DETECTION (MAHALANOBIS DISTANCE) ===\n")
+cat("Degrees of Freedom          :", length(cont_vars), "\n")
+cat("Critical Threshold (p=0.01):", round(critical_val, 3), "\n")
+cat("Multivariate Outliers      :", num_outliers, "(", round(num_outliers / nrow(train_df) * 100, 2), "% of training data)\n\n")
+
+#display detected multivariate outliers
+if(num_outliers > 0) {
+  print(train_df_outliers %>% 
+          dplyr::filter(is_outlier) %>% 
+          dplyr::select(DEATH_EVENT, mahal_dist, p_value, inv_serum_creatinine, ejection_fraction, age))
+}
+
+#visualize outliers
+ggplot(train_df_outliers, aes(x = seq_along(mahal_dist), y = mahal_dist, color = is_outlier)) +
+  geom_point(size = 2, alpha = 0.8) +
+  geom_hline(yintercept = critical_val, linetype = "dashed", color = "red", linewidth = 1) +
+  scale_color_manual(values = c("FALSE" = "#2b5c8f", "TRUE" = "#d95f02")) +
+  labs(
+    title = "Multivariate Outlier Detection via Mahalanobis Distance",
+    subtitle = paste0("Cutoff Threshold (df=6, alpha=0.01): ", round(critical_val, 2)),
+    x = "Observation Index (Training Data)",
+    y = "Mahalanobis Distance",
+    color = "Outlier"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+
+#clean training set
+train_df_clean <- train_df_outliers %>% dplyr::filter(!is_outlier)
+
+#refit with outliers removed
+
+#bic model clean
+bic_clean_model <- glm(
+  DEATH_EVENT ~ inv_serum_creatinine + age + ejection_fraction,
+  data = train_df_clean,
+  family = binomial(link = "logit")
+)
+
+#aic model clean
+aic_clean_model <- glm(
+  DEATH_EVENT ~ inv_serum_creatinine + age + ejection_fraction + 
+                high_blood_pressure + inv_serum_creatinine:ejection_fraction + 
+                age:ejection_fraction,
+  data = train_df_clean,
+  family = binomial(link = "logit")
+)
+
+#random forest clean
+#prepare clean dataset for random forest (factor outcome required)
+train_df_rf_clean <- train_df_clean
+train_df_rf_clean$DEATH_EVENT <- factor(ifelse(train_df_clean$DEATH_EVENT == 1, "Died", "Survived"), 
+                                       levels = c("Survived", "Died"))
+
+set.seed(42)
+rf_clean_fit <- randomForest(
+  DEATH_EVENT ~ age + cpk_pow_neg02 + ejection_fraction + sqrt_platelets + 
+                inv_serum_creatinine + serum_sodium + high_blood_pressure + 
+                anaemia + diabetes + smoking,
+  data = train_df_rf_clean,
+  ntree = 500,
+  importance = TRUE
+)
+
+#xgboost clean
+features <- c("age", "cpk_pow_neg02", "ejection_fraction", 
+              "sqrt_platelets", "inv_serum_creatinine", "serum_sodium",
+              "high_blood_pressure", "anaemia", "diabetes", "smoking")
+
+X_train_clean <- as.matrix(train_df_clean[, features])
+y_train_clean <- train_df_clean$DEATH_EVENT
+dtrain_clean  <- xgb.DMatrix(data = X_train_clean, label = y_train_clean)
+
+scale_pos_weight_clean <- sum(y_train_clean == 0) / sum(y_train_clean == 1)
+
+final_params_clean <- list(
+  booster          = "gbtree",
+  objective        = "binary:logistic",
+  eval_metric      = "auc",
+  max_depth        = best_params$max_depth,
+  eta              = best_params$eta,
+  subsample        = best_params$subsample,
+  colsample_bytree = best_params$colsample_bytree,
+  scale_pos_weight = scale_pos_weight_clean
+)
+
+set.seed(42)
+xgb_clean_fit <- xgb.train(
+  params  = final_params_clean,
+  data    = dtrain_clean,
+  nrounds = best_params$best_nrounds
+)
+
+#coefficient comparisons post update
+cat("\n=== CHAMPION BIC MODEL (FULL TRAINING DATA) ===\n")
+print(summary(best_model_bic)$coefficients)
+
+cat("\n=== CHAMPION BIC MODEL (REMOVED MULTIVARIATE OUTLIERS) ===\n")
+print(summary(bic_clean_model)$coefficients)
+
+cat("\n======================================================================\n")
+
+cat("\n=== AIC MODEL (FULL TRAINING DATA) ===\n")
+print(summary(best_model_aic)$coefficients)
+
+cat("\n=== AIC MODEL (REMOVED MULTIVARIATE OUTLIERS) ===\n")
+print(summary(aic_clean_model)$coefficients)
+
+#youdens optimization
+eval_sens_model <- function(probs, actual, label) {
+  roc_obj    <- pROC::roc(actual, probs, quiet = TRUE)
+  opt_thresh <- pROC::coords(roc_obj, "best", best.method = "youden")$threshold
+  preds      <- ifelse(probs >= opt_thresh, 1, 0)
+  
+  cm <- caret::confusionMatrix(
+    factor(preds, levels = c(0, 1)),
+    factor(actual, levels = c(0, 1)),
+    positive = "1"
+  )
+  
+  # Calculate MCC directly from confusion matrix
+  TP <- cm$table["1", "1"]
+  TN <- cm$table["0", "0"]
+  FP <- cm$table["1", "0"]
+  FN <- cm$table["0", "1"]
+  
+  num <- (TP * TN) - (FP * FN)
+  den <- sqrt(as.numeric(TP + FP) * as.numeric(TP + FN) * 
+              as.numeric(TN + FP) * as.numeric(TN + FN))
+  
+  mcc_val <- ifelse(den == 0, 0, num / den)
+  
+  tibble::tibble(
+    Model            = label,
+    Threshold        = round(opt_thresh, 4),
+    ROC_AUC          = round(pROC::auc(roc_obj), 4),
+    Sensitivity      = round(cm$byClass["Sensitivity"], 4),
+    Specificity      = round(cm$byClass["Specificity"], 4),
+    MCC              = round(mcc_val, 4),
+    Overall_Accuracy = round(cm$overall["Accuracy"], 4)
+  )
+}
+
+#test set predictions for full/clean models
+probs_bic_full  <- predict(best_model_bic, newdata = test_df, type = "response")
+probs_bic_clean <- predict(bic_clean_model, newdata = test_df, type = "response")
+
+probs_aic_full  <- predict(best_model_aic, newdata = test_df, type = "response")
+probs_aic_clean <- predict(aic_clean_model, newdata = test_df, type = "response")
+
+probs_rf_full   <- predict(rf_fit, newdata = test_df_rf, type = "prob")[, "Died"]
+probs_rf_clean  <- predict(rf_clean_fit, newdata = test_df_rf, type = "prob")[, "Died"]
+
+X_test_mat      <- as.matrix(test_df[, features])
+dtest_mat       <- xgb.DMatrix(data = X_test_mat)
+probs_xgb_full  <- predict(xgb_fit, dtest_mat)
+probs_xgb_clean <- predict(xgb_clean_fit, dtest_mat)
+
+#sensitivity analysis
+sens_summary <- dplyr::bind_rows(
+  eval_sens_model(probs_bic_full,  test_df$DEATH_EVENT, "1. BIC Model (Full Data)"),
+  eval_sens_model(probs_bic_clean, test_df$DEATH_EVENT, "2. BIC Model (Cleaned)"),
+  eval_sens_model(probs_aic_full,  test_df$DEATH_EVENT, "3. AIC Model (Full Data)"),
+  eval_sens_model(probs_aic_clean, test_df$DEATH_EVENT, "4. AIC Model (Cleaned)"),
+  eval_sens_model(probs_rf_full,   test_df$DEATH_EVENT, "5. Random Forest (Full Data)"),
+  eval_sens_model(probs_rf_clean,  test_df$DEATH_EVENT, "6. Random Forest (Cleaned)"),
+  eval_sens_model(probs_xgb_full,  test_df$DEATH_EVENT, "7. XGBoost Benchmark (Full Data)"),
+  eval_sens_model(probs_xgb_clean, test_df$DEATH_EVENT, "8. XGBoost Benchmark (Cleaned)")
+)
+
+cat("\n=== SENSITIVITY ANALYSIS PERFORMANCE COMPARISON (TEST SET) ===\n")
+print(as.data.frame(sens_summary))
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
